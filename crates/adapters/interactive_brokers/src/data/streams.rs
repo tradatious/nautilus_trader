@@ -731,6 +731,41 @@ struct HistoricalBarStreamState {
     last_disconnection_ns: Option<UnixNanos>,
     had_connection: bool,
     completion: HistoricalBarCompletion,
+
+    // Close of a bar discarded at a resubscribe; the replay start is clamped to no later
+    // than this until a replayed batch arrives.
+    replay_floor_ns: Option<UnixNanos>,
+}
+
+impl HistoricalBarStreamState {
+    /// Prepares a (re)subscribe and returns `(replay_start_ns, request_start_ns)`.
+    ///
+    /// A bar still pending from the previous stream is discarded without being published:
+    /// its grace deadline may have passed during the outage, and on re-entry the zero wait
+    /// would publish the pre-outage revision as final, resulting in the replayed true final
+    /// being dropped as already published. The replay start is clamped to no later than
+    /// that bar's close so its replayed row passes the replay filter, and the request
+    /// starts no later than the bar's open so the replay includes that bar.
+    fn begin_subscription(&mut self, bar_span_ns: u64) -> (UnixNanos, UnixNanos) {
+        if let Some(bar) = self.completion.discard_pending() {
+            self.replay_floor_ns = Some(
+                self.replay_floor_ns
+                    .map_or(bar.ts_event, |floor| floor.min(bar.ts_event)),
+            );
+        }
+        self.replay_start_ns =
+            resolve_historical_bar_replay_start_ns(self.first_start_ns, self.last_disconnection_ns);
+
+        let Some(floor) = self.replay_floor_ns else {
+            return (self.replay_start_ns, self.replay_start_ns);
+        };
+        self.replay_start_ns = self.replay_start_ns.min(floor);
+        let request_start_ns = UnixNanos::from(floor.as_u64().saturating_sub(bar_span_ns));
+        (
+            self.replay_start_ns,
+            request_start_ns.min(self.replay_start_ns),
+        )
+    }
 }
 
 /// How long after its close a bar still waiting for IB's final update is published anyway.
@@ -744,7 +779,8 @@ const HISTORICAL_BAR_COMPLETION_GRACE: DurationNanos = DurationNanos::from_secs(
 /// IB revises the open bar every 5 seconds and marks no update as final. A bar completes on
 /// the first of: an update received after its close, the grace period after its close, or the
 /// next bar's first update. It persists across resubscriptions, so a replayed history cannot
-/// publish a bar twice.
+/// publish a bar twice. A bar still pending at a resubscribe is discarded without being
+/// published and completed from the replay instead.
 #[derive(Debug, Default)]
 struct HistoricalBarCompletion {
     pending: Option<Bar>,
@@ -785,6 +821,11 @@ impl HistoricalBarCompletion {
             .map(|bar| bar.ts_event.saturating_add(HISTORICAL_BAR_COMPLETION_GRACE))
     }
 
+    // Drops the pending bar without publishing it
+    fn discard_pending(&mut self) -> Option<Bar> {
+        self.pending.take()
+    }
+
     fn expire(&mut self, now: UnixNanos) -> Option<Bar> {
         if self.deadline().is_none_or(|deadline| now < deadline) {
             return None;
@@ -822,7 +863,10 @@ pub(super) async fn handle_historical_bars_subscription(
         last_disconnection_ns: None,
         had_connection: false,
         completion: HistoricalBarCompletion::default(),
+        replay_floor_ns: None,
     }));
+
+    let bar_span_ns = (bar_type.spec().timedelta().as_secs().max(1) as u64) * 1_000_000_000;
 
     let context = StreamContext {
         stream_config,
@@ -849,18 +893,12 @@ pub(super) async fn handle_historical_bars_subscription(
             let contract = contract.clone();
             let stream_state = Arc::clone(&stream_state);
             Box::pin(async move {
-                let replay_start_ns = {
-                    let mut state = stream_state.lock().await;
-                    state.replay_start_ns = resolve_historical_bar_replay_start_ns(
-                        state.first_start_ns,
-                        state.last_disconnection_ns,
-                    );
-                    state.replay_start_ns
-                };
+                let (_, request_start_ns) =
+                    stream_state.lock().await.begin_subscription(bar_span_ns);
 
                 let duration = calculate_historical_bar_subscription_duration(
                     bar_type,
-                    replay_start_ns,
+                    request_start_ns,
                     context.clock.get_time_ns(),
                 );
                 context
@@ -954,6 +992,7 @@ where
                     Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
                         if !data.bars.is_empty() { monitor.received_data(); }
                         let replay_start_ns = mark_historical_bar_connected(&stream_state).await;
+                        stream_state.lock().await.replay_floor_ns = None;
 
                         for ib_bar in &data.bars {
                             let bar = ib_bar_to_nautilus_bar(
@@ -4676,5 +4715,71 @@ mod tests {
         );
         assert_eq!(replayed, [vec![], vec![]]);
         assert_eq!(completion.deadline(), Some(secs(182.0)));
+    }
+
+    fn bar_stream_state() -> super::HistoricalBarStreamState {
+        super::HistoricalBarStreamState {
+            first_start_ns: secs(0.0),
+            replay_start_ns: secs(0.0),
+            last_disconnection_ns: None,
+            had_connection: true,
+            completion: super::HistoricalBarCompletion::default(),
+            replay_floor_ns: None,
+        }
+    }
+
+    // Holds a revision of the bar closing at 120 s, detects a disconnect at
+    // `disconnect_at`, resubscribes at 200 s (past the 122 s grace deadline) and
+    // replays a batch whose row for that bar is the true final, returning the request
+    // start and every published bar (what the re-entry expiry publishes, then the
+    // replayed batch).
+    fn resubscribe_after_outage(disconnect_at: f64) -> (UnixNanos, Vec<Bar>) {
+        let mut state = bar_stream_state();
+        state
+            .completion
+            .observe(minute_bar(120, "100.10"), secs(115.0));
+        state.last_disconnection_ns = Some(secs(disconnect_at));
+
+        let (replay_start_ns, request_start_ns) = state.begin_subscription(60_000_000_000);
+
+        // Re-entry: an expired deadline wins against the replay read
+        let mut published: Vec<Bar> = state.completion.expire(secs(200.0)).into_iter().collect();
+
+        let batch = [minute_bar(60, "100.00"), minute_bar(120, "100.20")];
+        state.replay_floor_ns = None;
+        for bar in batch {
+            if super::should_emit_historical_bar(&bar, replay_start_ns) {
+                published.extend(state.completion.observe(bar, secs(200.0)));
+            }
+        }
+        (request_start_ns, published)
+    }
+
+    #[rstest]
+    fn test_historical_bar_resubscribe_disconnect_before_close_publishes_replayed_final() {
+        let (request_start_ns, published) = resubscribe_after_outage(118.0);
+
+        assert_eq!(published, vec![minute_bar(120, "100.20")]);
+        assert!(request_start_ns <= secs(60.0));
+    }
+
+    #[rstest]
+    fn test_historical_bar_resubscribe_disconnect_inside_grace_publishes_replayed_final() {
+        let (request_start_ns, published) = resubscribe_after_outage(121.0);
+
+        assert_eq!(published, vec![minute_bar(120, "100.20")]);
+        assert!(request_start_ns <= secs(60.0));
+    }
+
+    #[rstest]
+    fn test_historical_bar_resubscribe_with_nothing_pending_keeps_replay_start() {
+        let mut state = bar_stream_state();
+        state.last_disconnection_ns = Some(secs(121.0));
+
+        let (replay_start_ns, request_start_ns) = state.begin_subscription(60_000_000_000);
+
+        let expected = super::resolve_historical_bar_replay_start_ns(secs(0.0), Some(secs(121.0)));
+        assert_eq!(replay_start_ns, expected);
+        assert_eq!(request_start_ns, expected);
     }
 }
